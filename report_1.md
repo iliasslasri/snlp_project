@@ -16,4 +16,4 @@
       - try modern encoders
       - Cross-lingual Robustness: Testing if the robust quantizer trained on English generalizes to phonemes in other languages
     - Suggested by us:
-      - Adapt the evaluation to more used encoders like Encodec [Arxiv paper](https://arxiv.org/pdf/2210.13438), [huggingface](https://huggingface.co/facebook/encodec_32khz)
+      - Adapt the evaluation to more used encoders like Encodec [Arxiv paper](https://arxiv.org/pdf/2210.13438), [huggingface](https://huggingface.co/facebook/encodec_32khz) (To ask Maxime Poli about this)
