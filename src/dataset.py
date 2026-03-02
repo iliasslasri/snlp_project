@@ -1,5 +1,6 @@
 import torch
 import torchaudio
+import torchaudio.transforms as T
 from torch.utils.data import Dataset
 import random
 import os
@@ -14,36 +15,40 @@ class AugmentationPipeline:
     def time_stretch(self, waveform):
         """Apply random time stretching by resampling at a perturbed rate."""
         rate = random.uniform(0.8, 1.2)
-        # Speed change via resampling: resample to a shifted rate, then back
         orig_freq = self.sample_rate
         new_freq = int(orig_freq * rate)
-        effects = [["speed", str(rate)], ["rate", str(orig_freq)]]
-        augmented, _ = torchaudio.sox_effects.apply_effects_tensor(
-            waveform, orig_freq, effects, channels_first=True
-        )
-        return augmented
+        
+        # Simple resampling to approximate time stretching / speed change
+        resampler = T.Resample(orig_freq=orig_freq, new_freq=new_freq)
+        stretched = resampler(waveform)
+        
+        # Resample back to original rate to fit shapes (pitch and speed change)
+        resampler_back = T.Resample(orig_freq=new_freq, new_freq=orig_freq)
+        return resampler_back(stretched)
 
     def pitch_shift(self, waveform):
-        """Apply random pitch shifting using sox effects."""
+        """Apply random pitch shifting using torchaudio.transforms."""
         n_steps = random.randint(-4, 4)
         if n_steps == 0:
             return waveform
-        # pitch shift in cents (100 cents = 1 semitone)
-        cents = n_steps * 100
-        effects = [["pitch", str(cents)], ["rate", str(self.sample_rate)]]
-        augmented, _ = torchaudio.sox_effects.apply_effects_tensor(
-            waveform, self.sample_rate, effects, channels_first=True
+            
+        pitch_shifter = T.PitchShift(
+            sample_rate=self.sample_rate,
+            n_steps=n_steps
         )
-        return augmented
+        return pitch_shifter(waveform)
 
     def add_reverberation(self, waveform):
-        """Add synthetic reverberation using sox reverb effect."""
-        reverberance = random.randint(30, 80)
-        effects = [["reverb", str(reverberance)], ["channels", "1"]]
-        augmented, _ = torchaudio.sox_effects.apply_effects_tensor(
-            waveform, self.sample_rate, effects, channels_first=True
-        )
-        return augmented
+        """Add synthetic reverberation using a simple echo delay heuristic."""
+        # Simple echo delay heuristic since sox reverb is missing
+        delay = int(self.sample_rate * 0.05) # 50ms delay
+        decay = random.uniform(0.3, 0.8)
+        
+        echo = torch.zeros_like(waveform)
+        if waveform.shape[-1] > delay:
+            echo[..., delay:] = waveform[..., :-delay] * decay
+            
+        return waveform + echo
 
     def add_noise(self, waveform):
         """Add Gaussian noise at a random SNR between 10 and 40 dB."""
