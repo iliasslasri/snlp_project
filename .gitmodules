@@ -1,0 +1,3 @@
+[submodule "speech_encoder"]
+	path = speech_encoder
+	url = https://github.com/mxmpl/speech_encoder
