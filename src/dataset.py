@@ -11,20 +11,35 @@ class AugmentationPipeline:
     def __init__(self, sample_rate=16000, config=None):
         self.sample_rate = sample_rate
         self.config = config or {}
+        
+        # Cache resamplers for fixed stretch rates to avoid OOM in DataLoader workers
+        self.stretch_rates = [0.8, 0.85, 0.9, 0.95, 1.05, 1.1, 1.15, 1.2]
+        self.resamplers = {}
+        if self.config.get('time_stretch'):
+            for rate in self.stretch_rates:
+                new_freq = int(self.sample_rate * rate)
+                self.resamplers[rate] = (
+                    T.Resample(orig_freq=self.sample_rate, new_freq=new_freq),
+                    T.Resample(orig_freq=new_freq, new_freq=self.sample_rate)
+                )
+                
+        # Cache pitch shifters
+        self.pitch_shifters = {}
+        if self.config.get('pitch_shift'):
+            for n in range(-4, 5):
+                if n != 0:
+                    self.pitch_shifters[n] = T.PitchShift(sample_rate=self.sample_rate, n_steps=n)
 
     def time_stretch(self, waveform):
         """Apply random time stretching by resampling at a perturbed rate."""
-        rate = random.uniform(0.8, 1.2)
-        orig_freq = self.sample_rate
-        new_freq = int(orig_freq * rate)
+        rate = random.choice(self.stretch_rates)
         
         # Simple resampling to approximate time stretching / speed change
-        resampler = T.Resample(orig_freq=orig_freq, new_freq=new_freq)
-        stretched = resampler(waveform)
+        resample_down, resample_up = self.resamplers[rate]
+        stretched = resample_down(waveform)
         
         # Resample back to original rate to fit shapes (pitch and speed change)
-        resampler_back = T.Resample(orig_freq=new_freq, new_freq=orig_freq)
-        return resampler_back(stretched)
+        return resample_up(stretched)
 
     def pitch_shift(self, waveform):
         """Apply random pitch shifting using torchaudio.transforms."""
@@ -32,10 +47,7 @@ class AugmentationPipeline:
         if n_steps == 0:
             return waveform
             
-        pitch_shifter = T.PitchShift(
-            sample_rate=self.sample_rate,
-            n_steps=n_steps
-        )
+        pitch_shifter = self.pitch_shifters[n_steps]
         return pitch_shifter(waveform)
 
     def add_reverberation(self, waveform):
@@ -162,12 +174,9 @@ class AudioDataset(Dataset):
         if waveform.shape[0] > 1:
             waveform = waveform.mean(dim=0, keepdim=True)
 
-        # Resample if necessary
+        # Resample if necessary (using functional to avoid caching infinite rates, usually it's just 16k)
         if sample_rate != self.target_sr:
-            resampler = torchaudio.transforms.Resample(
-                orig_freq=sample_rate, new_freq=self.target_sr
-            )
-            waveform = resampler(waveform)
+            waveform = torchaudio.functional.resample(waveform, sample_rate, self.target_sr)
 
         # Truncate to max_length if set
         if self.max_length is not None and waveform.shape[-1] > self.max_length:
@@ -177,7 +186,8 @@ class AudioDataset(Dataset):
         clean_waveform = waveform.clone()
 
         if self.augment and self.augmenter:
-            augmented_waveform = self.augmenter(waveform)
-            return clean_waveform, augmented_waveform
+            with torch.no_grad():
+                augmented_waveform = self.augmenter(waveform)
+            return clean_waveform.detach(), augmented_waveform.detach()
 
-        return clean_waveform
+        return clean_waveform.detach()

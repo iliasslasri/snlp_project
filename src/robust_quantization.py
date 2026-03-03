@@ -112,7 +112,7 @@ def train_quantizer(cfg):
     tensorboard_dir = os.path.join(cfg.training.checkpoint_dir, "runs")
     writer = SummaryWriter(log_dir=tensorboard_dir)
 
-    logging.info("Starting training of Invariant Quantizer with TensorBoard Tracking...")
+    logging.info("Starting training of Invariant Quantizer...")
     
     for epoch in range(cfg.training.epochs):
         E1.train()
@@ -145,6 +145,7 @@ def train_quantizer(cfg):
             with torch.no_grad():
                 # Get the un-quantized representations from HuBERT
                 aug_feats, out_aug_lens = upstream_encoder(aug_audio, lengths=aug_lens)
+                aug_feats = aug_feats.clone()
                 
             # Forward through E1 (our MLP)
             logits = E1(aug_feats) # [batch, seq_len, num_codes]
