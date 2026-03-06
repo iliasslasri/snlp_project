@@ -10,8 +10,8 @@ def main(cfg: DictConfig):
         set_seed(cfg.seed)
     
     out_dir = cfg.training.checkpoint_dir if 'training' in cfg else 'outputs'
-    setup_logging(out_dir)
-    
+    setup_logging(out_dir)  # must be called before any logging
+
     logging.info(f"Configuration:\n{OmegaConf.to_yaml(cfg)}")
     logging.info("Starting Quantization Training...")
     

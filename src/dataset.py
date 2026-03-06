@@ -5,6 +5,14 @@ from torch.utils.data import Dataset
 import random
 import os
 import glob
+import soundfile as sf
+import numpy as np
+# torchaudio >= 2.5 defaults to torchcodec which requires an extra install.
+# Force soundfile backend which works out of the box on all platforms.
+try:
+    torchaudio.set_audio_backend("soundfile")
+except Exception:
+    pass  # older versions don't need this call
 
 
 class AugmentationPipeline:
@@ -168,7 +176,9 @@ class AudioDataset(Dataset):
 
     def __getitem__(self, idx):
         file_path = self.files[idx]
-        waveform, sample_rate = torchaudio.load(file_path)
+        # backend="soundfile" bypasses torchcodec (not supported on Windows)
+        data, sample_rate = sf.read(file_path, dtype="float32", always_2d=True)
+        waveform = torch.from_numpy(data.T)
 
         # Convert to mono if multi-channel
         if waveform.shape[0] > 1:
