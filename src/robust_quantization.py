@@ -5,7 +5,9 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 import sys
+import hydra
 import os
+import random
 import logging
 sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'speech_encoder', 'src'))
 
@@ -60,11 +62,13 @@ def train_quantizer(cfg):
     )
     
     # Augmentation pipeline is defined in AudioDataset if augment=True
+    noise_dir = cfg.dataset.get("noise_dir", None)
     aug_dataset = AudioDataset(
         root=cfg.dataset.root, 
         split=cfg.dataset.train_split, 
         augment=True,
-        config=cfg.dataset.augmentations
+        config=cfg.dataset.augmentations,
+        noise_dir=noise_dir
     )
     
     def collate_fn_paired(batch):
@@ -108,13 +112,28 @@ def train_quantizer(cfg):
 
     os.makedirs(cfg.training.checkpoint_dir, exist_ok=True)
     
-    # Enable Tensorboard logging
-    tensorboard_dir = os.path.join(cfg.training.checkpoint_dir, "runs")
+    tensorboard_dir = os.path.join(cfg.training.checkpoint_dir, "tensorboard")
     writer = SummaryWriter(log_dir=tensorboard_dir)
 
-    logging.info("Starting training of Invariant Quantizer...")
-    
-    for epoch in range(cfg.training.epochs):
+    best_loss = float('inf')
+    start_epoch = 0
+
+    # Resume from checkpoint if specified
+    resume_path = cfg.training.get("resume_from", None)
+    if resume_path is not None:
+        logging.info(f"Resuming from checkpoint: {resume_path}")
+        checkpoint = torch.load(resume_path, map_location=device)
+        E1.load_state_dict(checkpoint['model_state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        start_epoch = checkpoint['epoch'] + 1
+        best_loss = checkpoint.get('best_loss', float('inf'))
+        logging.info(f"  Resumed at epoch {start_epoch}, best_loss={best_loss:.4f}")
+
+    scheduler = None
+    if cfg.training.lr_scheduler is not None:
+        scheduler = hydra.utils.instantiate(cfg.training.lr_scheduler, optimizer=optimizer)
+    epoch = start_epoch
+    for epoch in range(start_epoch, cfg.training.epochs+start_epoch):
         E1.train()
         total_loss = 0.0
         
@@ -123,6 +142,16 @@ def train_quantizer(cfg):
             clean_lens = clean_lens.to(device)
             aug_audio = aug_audio.to(device)
             aug_lens = aug_lens.to(device)
+
+            # Log audio samples at the first batch of each epoch
+            if batch_idx == 0 and epoch % 10 == 0:
+                i = random.randint(0, clean_audio.shape[0] - 1)
+                c_len = clean_lens[i].item()
+                a_len = aug_lens[i].item()
+                clean_sample = clean_audio[i, :c_len].unsqueeze(0).cpu()
+                aug_sample = aug_audio[i, :a_len].unsqueeze(0).cpu()
+                writer.add_audio(f"Audio/clean_sample_{i}", clean_sample, epoch, sample_rate=16000)
+                writer.add_audio(f"Audio/augmented_sample_{i}", aug_sample, epoch, sample_rate=16000)
 
             # Target Generation using E0 (Clean Audio)
             with torch.no_grad():
@@ -168,24 +197,39 @@ def train_quantizer(cfg):
             
             loss.backward()
             optimizer.step()
-            
-            total_loss += loss.item()
+            if cfg.training.lr_scheduler is not None and epoch >= cfg.training.lr_scheduler_start_epoch:
+                scheduler.step()
             
             if batch_idx % cfg.training.log_interval == 0:
                 global_step = epoch * len(dataloader) + batch_idx
                 writer.add_scalar("Loss/CTC_Batch", loss.item(), global_step)
+                current_lr = optimizer.param_groups[0]['lr']
+                writer.add_scalar("LR/learning_rate", current_lr, global_step)
                 logging.info(f"Epoch {epoch} | Batch {batch_idx} | CTC Loss: {loss.item():.4f}")
 
         avg_loss = total_loss / len(dataloader)
         writer.add_scalar("Loss/CTC_Epoch", avg_loss, epoch)
         logging.info(f"--- Epoch {epoch} Complete | Avg CTC Loss: {avg_loss:.4f} ---")
         
-        # Save epoch checkpoint
-        torch.save(E1.state_dict(), os.path.join(cfg.training.checkpoint_dir, f"E1_epoch_{epoch}.pt"))
+        # Save best model
+        if avg_loss < best_loss:
+            best_loss = avg_loss
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': E1.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'best_loss': best_loss,
+            }, os.path.join(cfg.training.checkpoint_dir, "E1_best.pt"))
+            logging.info(f"    New best model saved (loss={best_loss:.4f})")
 
+    # Save last model
     logging.info("Training complete.")
-    torch.save(E1.state_dict(), os.path.join(cfg.training.checkpoint_dir, "E1_best.pt"))
+    torch.save({
+        'epoch': epoch,
+        'model_state_dict': E1.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'best_loss': best_loss,
+    }, os.path.join(cfg.training.checkpoint_dir, "E1_last.pt"))
     writer.close()
     
     # ITERATIVE REFINEMENT TODO
-            

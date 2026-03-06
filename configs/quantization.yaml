@@ -30,8 +30,7 @@ training:
   resume_from: null
   iterative_refinement_steps: 0 # set > 0 for iterative training
   lr_scheduler:
-    target: "torch.optim.lr_scheduler.CosineAnnealingLR"
-    params:
-      T_max: 50
-      eta_min: 1e-6
+    _target_: "torch.optim.lr_scheduler.CosineAnnealingLR"
+    T_max: 50
+    eta_min: 1e-6
   lr_scheduler_start_epoch: 100

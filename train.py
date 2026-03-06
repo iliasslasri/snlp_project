@@ -1,6 +1,8 @@
 import hydra
+from hydra.core.hydra_config import HydraConfig
 from omegaconf import DictConfig, OmegaConf
 import logging
+import os
 from src.utils import set_seed, setup_logging
 from src.robust_quantization import train_quantizer
 
@@ -9,8 +11,10 @@ def main(cfg: DictConfig):
     if cfg.get('seed'):
         set_seed(cfg.seed)
     
-    out_dir = cfg.training.checkpoint_dir if 'training' in cfg else 'outputs'
-    setup_logging(out_dir)
+    hydra_output_dir = HydraConfig.get().runtime.output_dir
+    setup_logging(hydra_output_dir)
+    
+    cfg.training.checkpoint_dir = hydra_output_dir
     
     logging.info(f"Configuration:\n{OmegaConf.to_yaml(cfg)}")
     logging.info("Starting Quantization Training...")
