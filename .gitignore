@@ -12,6 +12,7 @@ wheels/
 # Outputs and checkpoints
 outputs/
 checkpoints/
+noise_fullband/
 
 # Hydra
 .hydra/
@@ -20,4 +21,4 @@ checkpoints/
 .DS_Store
 
 LibriSpeech
-
+data

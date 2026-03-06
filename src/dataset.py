@@ -5,14 +5,25 @@ from torch.utils.data import Dataset
 import random
 import os
 import glob
+import numpy as np
+import pyroomacoustics as pra
 
 
 class AugmentationPipeline:
-    def __init__(self, sample_rate=16000, config=None):
+    def __init__(self, sample_rate=16000, config=None, noise_dir=None):
         self.sample_rate = sample_rate
         self.config = config or {}
+
+        # Scan noise directory for background noise files (DNS challenge)
+        self.noise_files = []
+        if noise_dir and os.path.isdir(noise_dir):
+            for ext in ("*.wav", "*.flac", "*.mp3", "*.ogg"):
+                self.noise_files.extend(
+                    glob.glob(os.path.join(noise_dir, "**", ext), recursive=True)
+                )
+            self.noise_files.sort()
         
-        # Cache resamplers for fixed stretch rates to avoid OOM in DataLoader workers
+        # Cache resamplers for fixed stretch rates
         self.stretch_rates = [0.8, 0.85, 0.9, 0.95, 1.05, 1.1, 1.15, 1.2]
         self.resamplers = {}
         if self.config.get('time_stretch'):
@@ -30,6 +41,16 @@ class AugmentationPipeline:
                 if n != 0:
                     self.pitch_shifters[n] = T.PitchShift(sample_rate=self.sample_rate, n_steps=n)
 
+        self.available = []
+        if self.config.get('reverberation'):
+            self.available.append(self.add_reverberation)
+        if self.config.get('noise'):
+            self.available.append(self.add_noise)
+        if self.config.get('time_stretch'):
+            self.available.append(self.time_stretch)
+        if self.config.get('pitch_shift'):
+            self.available.append(self.pitch_shift)
+            
     def time_stretch(self, waveform):
         """Apply random time stretching by resampling at a perturbed rate."""
         rate = random.choice(self.stretch_rates)
@@ -51,39 +72,109 @@ class AugmentationPipeline:
         return pitch_shifter(waveform)
 
     def add_reverberation(self, waveform):
-        """Add synthetic reverberation using a simple echo delay heuristic."""
-        # Simple echo delay heuristic since sox reverb is missing
-        delay = int(self.sample_rate * 0.05) # 50ms delay
-        decay = random.uniform(0.3, 0.8)
-        
-        echo = torch.zeros_like(waveform)
-        if waveform.shape[-1] > delay:
-            echo[..., delay:] = waveform[..., :-delay] * decay
-            
-        return waveform + echo
+        """Apply reverberation via pyroomacoustics room simulation.
+        Randomly samples room dimensions, RT60, mic and source positions,
+        computes the Room Impulse Response (RIR), and convolves it with
+        the speech signal (Chazan et al., 2021 setting)."""
+        orig_len = waveform.shape[-1]
+
+        # Random room dimensions (meters)
+        room_x = random.uniform(3.0, 8.0)
+        room_y = random.uniform(3.0, 6.0)
+        room_z = random.uniform(2.5, 4.0)
+
+        # Random RT60 reverberation time (seconds)
+        rt60 = random.uniform(0.2, 0.8)
+
+        # Compute absorption and max_order from RT60 using Sabine's formula
+        e_absorption, max_order = pra.inverse_sabine(rt60, [room_x, room_y, room_z])
+
+        room = pra.ShoeBox(
+            [room_x, room_y, room_z],
+            fs=self.sample_rate,
+            materials=pra.Material(e_absorption),
+            max_order=max_order,
+        )
+
+        # Random source position (inside the room with margin)
+        margin = 0.3
+        src_pos = [
+            random.uniform(margin, room_x - margin),
+            random.uniform(margin, room_y - margin),
+            random.uniform(margin, room_z - margin),
+        ]
+
+        # Random microphone position (inside the room with margin)
+        mic_pos = [
+            random.uniform(margin, room_x - margin),
+            random.uniform(margin, room_y - margin),
+            random.uniform(margin, room_z - margin),
+        ]
+
+        # Convert waveform to numpy for pyroomacoustics
+        signal_np = waveform.squeeze(0).cpu().numpy()
+
+        room.add_source(src_pos, signal=signal_np)
+        room.add_microphone(mic_pos)
+        room.simulate()
+
+        reverbed = room.mic_array.signals[0]  # shape: (n_samples,)
+
+        # Crop back to original length
+        reverbed = reverbed[:orig_len]
+
+        # Normalize to preserve original energy
+        orig_rms = np.sqrt(np.mean(signal_np ** 2)) + 1e-8
+        reverbed_rms = np.sqrt(np.mean(reverbed ** 2)) + 1e-8
+        reverbed = reverbed * (orig_rms / reverbed_rms)
+
+        result = torch.from_numpy(reverbed.astype(np.float32)).unsqueeze(0)
+        return result.to(waveform.device)
+
+    def _load_noise(self, target_length):
+        """Load a random noise clip, loop/crop to match target_length samples."""
+        noise_path = random.choice(self.noise_files)
+        noise, sr = torchaudio.load(noise_path)
+        # Convert to mono
+        if noise.shape[0] > 1:
+            noise = noise.mean(dim=0, keepdim=True)
+        # Resample to target sample rate
+        if sr != self.sample_rate:
+            noise = torchaudio.functional.resample(noise, sr, self.sample_rate)
+        # Loop if noise is shorter than signal
+        if noise.shape[-1] < target_length:
+            repeats = (target_length // noise.shape[-1]) + 1
+            noise = noise.repeat(1, repeats)
+        # Crop to exact length
+        noise = noise[:, :target_length]
+        return noise
 
     def add_noise(self, waveform):
-        """Add Gaussian noise at a random SNR between 10 and 40 dB."""
-        snr_db = random.uniform(10.0, 40.0)
+        """Mix with real background noise (DNS challenge) at SNR in [5, 15] dB.
+        Falls back to Gaussian noise if no noise files are available."""
+        snr_db = random.uniform(5.0, 15.0)
+
+        if self.noise_files:
+            noise = self._load_noise(waveform.shape[-1]).to(waveform.device)
+        else:
+            noise = torch.randn_like(waveform)
+
         signal_power = waveform.norm(p=2)
-        noise = torch.randn_like(waveform)
         noise_power = noise.norm(p=2)
         if noise_power == 0:
             return waveform
         snr_linear = 10 ** (snr_db / 20)
         scale = signal_power / (snr_linear * noise_power)
-        noisy = waveform + scale * noise
-        return noisy
+        return waveform + scale * noise
 
     def __call__(self, waveform):
-        if self.config.get('time_stretch'):
-            waveform = self.time_stretch(waveform)
-        if self.config.get('pitch_shift'):
-            waveform = self.pitch_shift(waveform)
-        if self.config.get('reverberation'):
-            waveform = self.add_reverberation(waveform)
-        if self.config.get('noise'):
-            waveform = self.add_noise(waveform)
+        if self.available:
+            # Randomly sample 0 to min(4, len(available)) augmentations
+            k = random.randint(0, min(4, len(self.available)))
+            selected = random.sample(self.available, k)
+            for aug_fn in selected:
+                waveform = aug_fn(waveform)
+
         return waveform
 
 
@@ -100,14 +191,14 @@ class AudioDataset(Dataset):
     """
 
     def __init__(self, root, split="train", augment=False, config=None,
-                 target_sr=16000, max_length=None):
+                 target_sr=16000, max_length=None, noise_dir=None):
         self.root = root
         self.split = split
         self.augment = augment
         self.target_sr = target_sr
         self.max_length = max_length  # max samples; None = no truncation
         self.augmenter = AugmentationPipeline(
-            sample_rate=target_sr, config=config
+            sample_rate=target_sr, config=config, noise_dir=noise_dir
         ) if augment else None
         self.files = self._load_files()
 
