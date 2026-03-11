@@ -5,53 +5,21 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 import sys
+import hydra
 import os
-import copy
+import random
 import logging
-from tqdm import tqdm
 sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'speech_encoder', 'src'))
 
 from speech_encoder import SpeechEncoder
 from .models import RobustQuantizer
 from .dataset import AudioDataset
-from .utils import unit_edit_distance
-
-
-def collate_fn_paired(batch):
-    """Collate (clean, augmented) pairs into padded batch tensors.
-    Must be defined at module level (not inside a function) for Windows
-    multiprocessing compatibility (spawn requires pickling).
-    """
-    clean_waves = [b[0] for b in batch]
-    aug_waves = [b[1] for b in batch]
-
-    max_clean_len = max(w.shape[-1] for w in clean_waves)
-    max_aug_len = max(w.shape[-1] for w in aug_waves)
-
-    padded_clean = torch.zeros(len(batch), 1, max_clean_len)
-    padded_aug = torch.zeros(len(batch), 1, max_aug_len)
-
-    clean_lens = torch.zeros(len(batch), dtype=torch.long)
-    aug_lens = torch.zeros(len(batch), dtype=torch.long)
-
-    for i, (cw, aw) in enumerate(zip(clean_waves, aug_waves)):
-        clean_lens[i] = cw.shape[-1]
-        padded_clean[i, :, :cw.shape[-1]] = cw
-        aug_lens[i] = aw.shape[-1]
-        padded_aug[i, :, :aw.shape[-1]] = aw
-
-    # HuBERT expects [batch, time]
-    padded_clean = padded_clean.squeeze(1)
-    padded_aug = padded_aug.squeeze(1)
-
-    return padded_clean, clean_lens, padded_aug, aug_lens
 
 
 def create_speech_encoder(cfg, device):
     """Loads E0 (SpeechEncoder) with HuBERT + KMeans."""
     logging.info(f"Loading continuous encoder and KMeans for '{cfg.model.name}'...")
     # SpeechEncoder from the library loads the dense model and the quantizer
-    print("Device : ", device)
     return SpeechEncoder.from_textlesslib(
         name=cfg.model.name,
         layer=cfg.model.layer,
@@ -61,39 +29,51 @@ def create_speech_encoder(cfg, device):
     ).to(device)
 
 
-@torch.no_grad()
-def _evaluate_ued(E_teacher, E_student, upstream_encoder, dataloader, device):
-    """Compute UED between E_teacher on clean and E_student on augmented audio."""
-    E_teacher.eval()
-    E_student.eval()
-    upstream_encoder.eval()
-
-    orig_units_all = []
-    aug_units_all  = []
-
-    for clean_audio, clean_lens, aug_audio, aug_lens in tqdm(dataloader, desc="  UED eval", leave=False):
-        clean_audio = clean_audio.to(device)
-        clean_lens  = clean_lens.to(device)
-        aug_audio   = aug_audio.to(device)
-        aug_lens    = aug_lens.to(device)
-
-        clean_outputs = E_teacher(clean_audio, lengths=clean_lens, formatted=True)
+def _generate_targets_E0(E0, clean_audio, clean_lens, device):
+    """Generate pseudo-labels on-the-fly using E0 (KMeans)."""
+    with torch.no_grad():
+        clean_outputs = E0(clean_audio, lengths=clean_lens, formatted=True)
+        target_sequences = []
+        target_lengths = []
         for out in clean_outputs:
-            orig_units_all.append(out['units'])
+            units = torch.tensor(out['units'], dtype=torch.long, device=device)
+            target_sequences.append(units)
+            target_lengths.append(len(units))
+        flat_targets = torch.cat(target_sequences)
+        target_lengths = torch.tensor(target_lengths, dtype=torch.long, device=device)
+    return flat_targets, target_lengths
 
-        aug_feats, _ = upstream_encoder(aug_audio, lengths=aug_lens)
-        logits = E_student(aug_feats)
-        preds  = logits.argmax(dim=-1)
+
+def _generate_targets_E1(prev_E1, upstream_encoder, clean_audio, clean_lens, device):
+    """Generate pseudo-labels on-the-fly using a converged E1 (argmax + dedup)."""
+    with torch.no_grad():
+        feats, out_lens = upstream_encoder(clean_audio, lengths=clean_lens)
+        logits = prev_E1(feats)
+        preds = logits.argmax(dim=-1)
+
+        if out_lens is None:
+            out_lens = torch.full((preds.shape[0],), preds.shape[1],
+                                 dtype=torch.long, device=device)
+        target_sequences = []
+        target_lengths = []
         for i in range(preds.shape[0]):
-            aug_units_all.append(preds[i].cpu().tolist())
+            valid = preds[i, :out_lens[i]]
+            deduped = torch.unique_consecutive(valid)
+            target_sequences.append(deduped)
+            target_lengths.append(len(deduped))
 
-    return unit_edit_distance(orig_units_all, aug_units_all)
+        flat_targets = torch.cat(target_sequences)
+        target_lengths = torch.tensor(target_lengths, dtype=torch.long, device=device)
+    return flat_targets, target_lengths
 
 
 def train_quantizer(cfg):
     """
     Trains the augmentation-invariant discrete representation (E1) using CTC loss
     against pseudo-labels generated from unmodified audio using E0 (KMeans).
+
+    Supports iterative pseudo-labeling: after convergence, E1
+    replaces E0 as the teacher and a fresh MLP is trained. Repeat K times.
     """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
@@ -105,158 +85,200 @@ def train_quantizer(cfg):
     upstream_encoder = E0.dense
     upstream_encoder.eval() # Upstream is always frozen
     
-    # Initialize our learnable invariant quantizer (E1)
     vocab_size = cfg.model.vocab_size
-    # +1 for the CTC blank token
-    E1 = RobustQuantizer(
-        input_dim=768, # HuBERT Base
-        hidden_dim=cfg.model.quantizer.hidden_dim, 
-        num_codes=vocab_size + 1 
-    ).to(device)
     
     # Dataset and DataLoader
-    # Clean dataset (no augmentations) for E0
-    clean_dataset = AudioDataset(
-        root=cfg.dataset.root, 
-        split=cfg.dataset.train_split, 
-        augment=False
-    )
-    
-    # Augmentation pipeline is defined in AudioDataset if augment=True
+    noise_dir = cfg.dataset.get("noise_dir", None)
+    max_length = cfg.dataset.get("max_audio_length", None)
     aug_dataset = AudioDataset(
         root=cfg.dataset.root, 
         split=cfg.dataset.train_split, 
         augment=True,
-        config=cfg.dataset.augmentations
+        config=cfg.dataset.augmentations,
+        noise_dir=noise_dir,
+        max_length=max_length
     )
+    
+    def collate_fn_paired(batch):
+        # batch is list of (clean_waveform, augmented_waveform)
+        clean_waves = [b[0] for b in batch]
+        aug_waves = [b[1] for b in batch]
+        
+        max_clean_len = max(w.shape[-1] for w in clean_waves)
+        max_aug_len = max(w.shape[-1] for w in aug_waves)
+        
+        padded_clean = torch.zeros(len(batch), 1, max_clean_len)
+        padded_aug = torch.zeros(len(batch), 1, max_aug_len)
+        
+        clean_lens = torch.zeros(len(batch), dtype=torch.long)
+        aug_lens = torch.zeros(len(batch), dtype=torch.long)
+        
+        for i, (cw, aw) in enumerate(zip(clean_waves, aug_waves)):
+            clean_lens[i] = cw.shape[-1]
+            padded_clean[i, :, :cw.shape[-1]] = cw
+            aug_lens[i] = aw.shape[-1]
+            padded_aug[i, :, :aw.shape[-1]] = aw
+            
+        # Squeeze the channel dim if it's 1 since HuBERT expects [batch, time]
+        padded_clean = padded_clean.squeeze(1)
+        padded_aug = padded_aug.squeeze(1)
+            
+        return padded_clean, clean_lens, padded_aug, aug_lens
 
     dataloader = DataLoader(
         aug_dataset, 
         batch_size=cfg.dataset.batch_size, 
         shuffle=True, 
         collate_fn=collate_fn_paired,
-        num_workers=0  # 0 required on Windows (spawn multiprocessing incompatibility)
+        num_workers=cfg.dataset.num_workers
     )
 
-    optimizer = optim.Adam(E1.parameters(), lr=cfg.training.learning_rate)
-    
-    # CTC loss expects (T, N, C) for inputs
-    ctc_loss = nn.CTCLoss(blank=vocab_size, zero_infinity=True)
+    n_pseudo = cfg.training.get("n_iterative_pseudolabeling", 0)
+    total_rounds = 1 + n_pseudo
+    base_checkpoint_dir = cfg.training.checkpoint_dir
+    prev_E1 = None  # teacher for rounds > 0
 
-    os.makedirs(cfg.training.checkpoint_dir, exist_ok=True)
-    
-    # Enable Tensorboard logging
-    tensorboard_dir = os.path.join(cfg.training.checkpoint_dir, "runs")
-    writer = SummaryWriter(log_dir=tensorboard_dir)
+    for round_idx in range(total_rounds):
+        logging.info(f"=== Round {round_idx}/{total_rounds - 1} ===")
 
-    logging.info("Starting training of Invariant Quantizer...")
+        round_dir = os.path.join(base_checkpoint_dir, f"round_{round_idx}")
+        os.makedirs(round_dir, exist_ok=True)
 
-    def _run_training_loop(E_teacher, E_student, optimizer, label):
-        """Run cfg.training.epochs of CTC training. E_teacher is always frozen."""
-        epoch_pbar = tqdm(range(cfg.training.epochs), desc=f"[{label}] Epochs", unit="epoch")
+        # Initialize a fresh E1 (MLP) each round
+        E1 = RobustQuantizer(
+            input_dim=768, # HuBERT Base
+            hidden_dim=cfg.model.quantizer.hidden_dim, 
+            num_codes=vocab_size + 1  # +1 for CTC blank
+        ).to(device)
 
-        for epoch in epoch_pbar:
-            E_student.train()
+        optimizer = optim.Adam(E1.parameters(), lr=cfg.training.learning_rate)
+        ctc_loss = nn.CTCLoss(blank=vocab_size, zero_infinity=True)
+
+        tensorboard_dir = os.path.join(round_dir, "tensorboard")
+        writer = SummaryWriter(log_dir=tensorboard_dir)
+
+        best_loss = float('inf')
+        start_epoch = 0
+
+        # Resume from checkpoint (only round 0)
+        if round_idx == 0:
+            resume_path = cfg.training.get("resume_from", None)
+            if resume_path is not None:
+                logging.info(f"Resuming from checkpoint: {resume_path}")
+                checkpoint = torch.load(resume_path, map_location=device)
+                E1.load_state_dict(checkpoint['model_state_dict'])
+                optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                start_epoch = checkpoint['epoch'] + 1
+                best_loss = checkpoint.get('best_loss', float('inf'))
+                logging.info(f"  Resumed at epoch {start_epoch}, best_loss={best_loss:.4f}")
+
+        scheduler = None
+        if cfg.training.lr_scheduler is not None:
+            scheduler = hydra.utils.instantiate(cfg.training.lr_scheduler, optimizer=optimizer)
+
+        epoch = start_epoch
+        for epoch in range(start_epoch, cfg.training.epochs + start_epoch):
+            E1.train()
             total_loss = 0.0
-
-            batch_pbar = tqdm(dataloader, desc=f"  Epoch {epoch}", unit="batch", leave=False)
-
-            for batch_idx, (clean_audio, clean_lens, aug_audio, aug_lens) in enumerate(batch_pbar):
+            
+            for batch_idx, (clean_audio, clean_lens, aug_audio, aug_lens) in enumerate(dataloader):
                 clean_audio = clean_audio.to(device)
                 clean_lens = clean_lens.to(device)
                 aug_audio = aug_audio.to(device)
                 aug_lens = aug_lens.to(device)
 
-                # Target Generation using E_teacher (Clean Audio)
-                with torch.no_grad():
-                    clean_outputs = E_teacher(clean_audio, lengths=clean_lens, formatted=True)
+                # Log audio samples at the first batch of epoch 10 (randomly selected)
+                if batch_idx == 0 and epoch == 10:
+                    i = random.randint(0, clean_audio.shape[0] - 1)
+                    c_len = clean_lens[i].item()
+                    a_len = aug_lens[i].item()
+                    clean_sample = clean_audio[i, :c_len].unsqueeze(0).cpu()
+                    aug_sample = aug_audio[i, :a_len].unsqueeze(0).cpu()
+                    writer.add_audio(f"Audio/clean_sample_{i}", clean_sample, epoch, sample_rate=16000)
+                    writer.add_audio(f"Audio/augmented_sample_{i}", aug_sample, epoch, sample_rate=16000)
 
-                    target_sequences = []
-                    target_lengths = []
-                    for out in clean_outputs:
-                        units = torch.tensor(out['units'], dtype=torch.long, device=device)
-                        target_sequences.append(units)
-                        target_lengths.append(len(units))
+                # Target Generation: E0 for round 0, converged E_{k-1} for round k
+                if round_idx == 0:
+                    flat_targets, target_lengths = _generate_targets_E0(
+                        E0, clean_audio, clean_lens, device)
+                else:
+                    flat_targets, target_lengths = _generate_targets_E1(
+                        prev_E1, upstream_encoder, clean_audio, clean_lens, device)
 
-                    flat_targets = torch.cat(target_sequences)
-                    target_lengths = torch.tensor(target_lengths, dtype=torch.long, device=device)
-
+                # Prediction using E1 (Augmented Audio)
                 optimizer.zero_grad()
-
+                
                 with torch.no_grad():
+                    # Get the un-quantized representations from HuBERT
                     aug_feats, out_aug_lens = upstream_encoder(aug_audio, lengths=aug_lens)
                     aug_feats = aug_feats.clone()
-
-                logits = E_student(aug_feats)
+                    
+                # Forward through E1 (our MLP)
+                logits = E1(aug_feats) # [batch, seq_len, num_codes]
+                
+                # log_softmax is needed for CTC
                 log_probs = F.log_softmax(logits, dim=-1)
+                
+                # Permute to [seq_len, batch, num_codes] inside for CTC
                 log_probs = log_probs.permute(1, 0, 2)
-
+                
+                # Input lengths are the number of frames generated by HuBERT
                 if out_aug_lens is None:
                     out_aug_lens = torch.full((logits.shape[0],), logits.shape[1], dtype=torch.long, device=device)
                 else:
                     out_aug_lens = out_aug_lens.to(device)
 
+                # CTC Loss
                 loss = ctc_loss(log_probs, flat_targets, out_aug_lens, target_lengths)
+                
                 loss.backward()
                 optimizer.step()
+                if scheduler is not None and epoch >= cfg.training.lr_scheduler_start_epoch:
+                    scheduler.step()
 
                 total_loss += loss.item()
-
-                # Update inner bar with current loss
-                batch_pbar.set_postfix(loss=f"{loss.item():.4f}")
-
+                
                 if batch_idx % cfg.training.log_interval == 0:
                     global_step = epoch * len(dataloader) + batch_idx
-                    writer.add_scalar(f"Loss/{label}_CTC_Batch", loss.item(), global_step)
-                    logging.info(f"[{label}] Epoch {epoch} | Batch {batch_idx} | CTC Loss: {loss.item():.4f}")
+                    writer.add_scalar("Loss/CTC_Batch", loss.item(), global_step)
+                    current_lr = optimizer.param_groups[0]['lr']
+                    writer.add_scalar("LR/learning_rate", current_lr, global_step)
+                    logging.info(f"[Round {round_idx}] Epoch {epoch} | Batch {batch_idx} | CTC Loss: {loss.item():.4f}")
 
             avg_loss = total_loss / len(dataloader)
-            writer.add_scalar(f"Loss/{label}_CTC_Epoch", avg_loss, epoch)
-            logging.info(f"--- [{label}] Epoch {epoch} Complete | Avg CTC Loss: {avg_loss:.4f} ---")
+            writer.add_scalar("Loss/CTC_Epoch", avg_loss, epoch)
+            logging.info(f"--- [Round {round_idx}] Epoch {epoch} Complete | Avg CTC Loss: {avg_loss:.4f} ---")
+            
+            # Save best model
+            if avg_loss < best_loss:
+                best_loss = avg_loss
+                torch.save({
+                    'epoch': epoch,
+                    'model_state_dict': E1.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'best_loss': best_loss,
+                }, os.path.join(round_dir, "E1_best.pt"))
+                logging.info(f"    New best model saved (loss={best_loss:.4f})")
 
-            # Update outer bar with avg loss
-            epoch_pbar.set_postfix(avg_loss=f"{avg_loss:.4f}")
+        # Save last model
+        torch.save({
+            'epoch': epoch,
+            'model_state_dict': E1.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'best_loss': best_loss,
+        }, os.path.join(round_dir, "E1_last.pt"))
+        writer.close()
 
-            torch.save(E_student.state_dict(), os.path.join(cfg.training.checkpoint_dir, f"{label}_epoch_{epoch}.pt"))
+        # After convergence, this E1 becomes the teacher for the next round
+        if round_idx < total_rounds - 1:
+            prev_E1 = RobustQuantizer(
+                input_dim=768,
+                hidden_dim=cfg.model.quantizer.hidden_dim,
+                num_codes=vocab_size + 1,
+            ).to(device)
+            best_ckpt = torch.load(os.path.join(round_dir, "E1_best.pt"), map_location=device)
+            prev_E1.load_state_dict(best_ckpt['model_state_dict'])
+            prev_E1.eval()
+            logging.info(f"  E{round_idx + 1} will use converged E{round_idx} as teacher.")
 
-    # --- Step 1: Non-iterative (Section 4.1) ---
-    _run_training_loop(E_teacher=E0, E_student=E1, optimizer=optimizer, label="E1")
-
-    logging.info("Training complete.")
-    torch.save(E1.state_dict(), os.path.join(cfg.training.checkpoint_dir, "E1_best.pt"))
-
-    # --- Step 2: Iterative refinement (Section 4.2) ---
-    # Upon E1 convergence, freeze it and use it as the new teacher to train E2,
-    # then E2 teaches E3, etc. Only replace after full convergence.
-    num_iterations = getattr(cfg.training, 'num_iterations', 1)
-
-    E_prev = E1
-    for iteration in range(2, num_iterations + 1):
-        logging.info(f"=== Iterative refinement: training E{iteration} ===")
-
-        # Freeze the converged teacher
-        E_teacher = copy.deepcopy(E_prev)
-        E_teacher.eval()
-        for p in E_teacher.parameters():
-            p.requires_grad_(False)
-
-        # Fresh student for this iteration
-        E_next = RobustQuantizer(
-            input_dim=768,
-            hidden_dim=cfg.model.quantizer.hidden_dim,
-            num_codes=vocab_size + 1
-        ).to(device)
-        optimizer_next = optim.Adam(E_next.parameters(), lr=cfg.training.learning_rate)
-
-        _run_training_loop(E_teacher=E_teacher, E_student=E_next,
-                           optimizer=optimizer_next, label=f"E{iteration}")
-
-        # Evaluate UED after convergence
-        ued = _evaluate_ued(E_teacher, E_next, upstream_encoder, dataloader, device)
-        writer.add_scalar("UED/iterative", ued, iteration)
-        logging.info(f"[E{iteration}] UED = {ued:.2f}")
-
-        torch.save(E_next.state_dict(), os.path.join(cfg.training.checkpoint_dir, f"E{iteration}_best.pt"))
-        E_prev = E_next  # converged student becomes teacher for next round
-
-    writer.close()
+    logging.info("All rounds complete.")
