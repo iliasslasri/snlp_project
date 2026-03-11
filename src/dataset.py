@@ -22,6 +22,16 @@ class AugmentationPipeline:
                     glob.glob(os.path.join(noise_dir, "**", ext), recursive=True)
                 )
             self.noise_files.sort()
+            
+        # Scan rir directory for offline room impulse responses
+        self.rir_files = []
+        rir_dir = self.config.get('rir_dir')
+        if rir_dir and os.path.isdir(rir_dir):
+            for ext in ("*.wav", "*.flac", "*.mp3", "*.ogg"):
+                self.rir_files.extend(
+                    glob.glob(os.path.join(rir_dir, "**", ext), recursive=True)
+                )
+            self.rir_files.sort()
         
         # Cache resamplers for fixed stretch rates
         self.stretch_rates = [0.8, 0.85, 0.9, 0.95, 1.05, 1.1, 1.15, 1.2]
@@ -72,12 +82,35 @@ class AugmentationPipeline:
         return pitch_shifter(waveform)
 
     def add_reverberation(self, waveform):
-        """Apply reverberation via pyroomacoustics room simulation.
-        Randomly samples room dimensions, RT60, mic and source positions,
-        computes the Room Impulse Response (RIR), and convolves it with
-        the speech signal (Chazan et al., 2021 setting)."""
+        """Apply reverberation by convolving with a precomputed or simulated Room Impulse Response (RIR)."""
         orig_len = waveform.shape[-1]
+        
+        # Fast path: use offline RIRs
+        if self.rir_files:
+            rir_path = random.choice(self.rir_files)
+            rir, sr = torchaudio.load(rir_path)
+            
+            # Resample RIR if necessary
+            if sr != self.sample_rate:
+                rir = torchaudio.functional.resample(rir, sr, self.sample_rate)
+                
+            rir = rir.to(waveform.device)
+            
+            # Apply convolution using torchaudio.functional.fftconvolve (fast)
+            # Both waveform and rir should be [channel, time].
+            reverbed = torchaudio.functional.fftconvolve(waveform, rir, mode="full")
+            
+            # Crop back to original length
+            reverbed = reverbed[..., :orig_len]
+            
+            # Normalize to preserve original energy
+            orig_rms = waveform.norm(p=2) + 1e-8
+            reverbed_rms = reverbed.norm(p=2) + 1e-8
+            reverbed = reverbed * (orig_rms / reverbed_rms)
+            
+            return reverbed
 
+        # Slow fallback path: simulate on-the-fly (useful for debugging, but very slow)
         # Random room dimensions (meters)
         room_x = random.uniform(3.0, 8.0)
         room_y = random.uniform(3.0, 6.0)
@@ -87,7 +120,11 @@ class AugmentationPipeline:
         rt60 = random.uniform(0.2, 0.8)
 
         # Compute absorption and max_order from RT60 using Sabine's formula
-        e_absorption, max_order = pra.inverse_sabine(rt60, [room_x, room_y, room_z])
+        try:
+            e_absorption, max_order = pra.inverse_sabine(rt60, [room_x, room_y, room_z])
+        except ValueError:
+             e_absorption = 0.2
+             max_order = 10
 
         room = pra.ShoeBox(
             [room_x, room_y, room_z],

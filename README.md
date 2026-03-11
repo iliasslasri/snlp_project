@@ -17,6 +17,13 @@ bash src/scripts/download-dns-challenge-5-noise-ir.sh
 ```
 
 run a training:
+
+First, generate RIRs:
+```bash
+uv run python src/scripts/simulate_rirs.py --n 50 # in our training we generate 4000 RIRs
+```
+
+then run the training:
 ```bash
 uv run python train.py
 

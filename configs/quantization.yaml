@@ -2,9 +2,9 @@ defaults:
   - _self_
 
 dataset:
-  root: "LibriSpeech"
-  train_split: "data/LibriSpeech/train-clean-100"
-  test_split: "data/LibriSpeech/test-clean"
+  root: "data/LibriSpeech"
+  train_split: "train-clean-100"
+  test_split: "test-clean"
   batch_size: 16 
   num_workers: 1
   noise_dir: "noise_fullband"
@@ -14,6 +14,7 @@ dataset:
     pitch_shift: true
     reverberation: true
     noise: true
+    rir_dir: "data/rirs"
 
 model:
   name: "hubert-base-ls960"
