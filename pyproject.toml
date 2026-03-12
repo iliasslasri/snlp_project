@@ -23,6 +23,7 @@ dependencies = [
   "torchaudio==2.1.2",
   "transformers>=4.30.0",
   "pyroomacoustics",
+  "julius",
 ]
 
 [dependency-groups]
