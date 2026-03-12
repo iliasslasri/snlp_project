@@ -233,8 +233,6 @@ def train_quantizer(cfg):
                 
                 loss.backward()
                 optimizer.step()
-                if scheduler is not None and epoch >= cfg.training.lr_scheduler_start_epoch:
-                    scheduler.step()
 
                 total_loss += loss.item()
                 
@@ -247,6 +245,8 @@ def train_quantizer(cfg):
 
             avg_loss = total_loss / len(dataloader)
             writer.add_scalar("Loss/CTC_Epoch", avg_loss, epoch)
+            if scheduler is not None and epoch >= cfg.training.lr_scheduler_start_epoch:
+                scheduler.step()
             logging.info(f"--- [Round {round_idx}] Epoch {epoch} Complete | Avg CTC Loss: {avg_loss:.4f} ---")
             
             # Save best model
