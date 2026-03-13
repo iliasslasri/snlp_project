@@ -6,13 +6,26 @@ import random
 import os
 import glob
 import numpy as np
+import julius
+from julius import fft_conv1d, resample_frac
 import pyroomacoustics as pra
+
+
+def generate_pink_noise(length: int) -> torch.Tensor:
+    """Generate pink noise using Voss-McCartney algorithm."""
+    num_rows = 16
+    array = torch.randn(num_rows, length // num_rows + 1)
+    reshaped_array = torch.cumsum(array, dim=1)
+    reshaped_array = reshaped_array.reshape(-1)[:length]
+    return reshaped_array / (torch.max(torch.abs(reshaped_array)) + 1e-8)
 
 
 class AugmentationPipeline:
     def __init__(self, sample_rate=16000, config=None, noise_dir=None):
         self.sample_rate = sample_rate
         self.config = config or {}
+        self.max_augs = self.config.get('max_augs', 4)  # number of augmentations to apply per sample
+                                                # we sample k ~ Uniform(0, n_aug) augmentations to apply per sample
 
         # Scan noise directory for background noise files (DNS challenge)
         self.noise_files = []
@@ -60,6 +73,37 @@ class AugmentationPipeline:
             self.available.append(self.time_stretch)
         if self.config.get('pitch_shift'):
             self.available.append(self.pitch_shift)
+        # new augmentations
+        if self._aug_enabled('echo'):
+            self.available.append(self.echo)
+        if self._aug_enabled('random_noise'):
+            self.available.append(self.random_noise)
+        if self._aug_enabled('pink_noise'):
+            self.available.append(self.pink_noise_aug)
+        if self._aug_enabled('lowpass_filter'):
+            self.available.append(self.lowpass_filter)
+        if self._aug_enabled('highpass_filter'):
+            self.available.append(self.highpass_filter)
+        if self._aug_enabled('bandpass_filter'):
+            self.available.append(self.bandpass_filter)
+        if self._aug_enabled('smooth'):
+            self.available.append(self.smooth)
+        if self._aug_enabled('boost_audio'):
+            self.available.append(self.boost_audio)
+        if self._aug_enabled('duck_audio'):
+            self.available.append(self.duck_audio)
+        if self._aug_enabled('updownresample'):
+            self.available.append(self.updownresample)
+
+    def _aug_enabled(self, name):
+        """Check if an augmentation sub-config exists and has enabled=true."""
+        cfg = self.config.get(name)
+        if cfg is None:
+            return False
+        if isinstance(cfg, dict):
+            return cfg.get('enabled', False)
+        # DictConfig from omegaconf
+        return getattr(cfg, 'enabled', False)
             
     def time_stretch(self, waveform):
         """Apply random time stretching by resampling at a perturbed rate."""
@@ -204,10 +248,116 @@ class AugmentationPipeline:
         scale = signal_power / (snr_linear * noise_power)
         return waveform + scale * noise
 
+    def _aug_cfg(self, name):
+        """Return the sub-config dict for an augmentation."""
+        cfg = self.config.get(name, {})
+        if isinstance(cfg, dict):
+            return cfg
+        # OmegaConf DictConfig: convert to plain dict
+        try:
+            from omegaconf import OmegaConf
+            return OmegaConf.to_container(cfg, resolve=True)
+        except ImportError:
+            return dict(cfg)
+
+    def echo(self, waveform):
+        """Add echo by convolving with a simple impulse response."""
+        cfg = self._aug_cfg('echo')
+        volume_range = cfg.get('volume_range', [0.1, 0.5])
+        duration_range = cfg.get('duration_range', [0.1, 0.5])
+
+        duration = random.uniform(*duration_range)
+        volume = random.uniform(*volume_range)
+        n_samples = int(self.sample_rate * duration)
+        if n_samples < 2:
+            return waveform
+
+        ir = torch.zeros(n_samples, dtype=waveform.dtype, device=waveform.device)
+        ir[0] = 1.0
+        ir[-1] = volume
+        ir = ir.unsqueeze(0).unsqueeze(0)  # [1, 1, time]
+
+        # waveform is [1, time] -> add batch dim for fft_conv1d
+        out = fft_conv1d(waveform.unsqueeze(0), ir).squeeze(0)
+        # Preserve amplitude
+        max_orig = torch.max(torch.abs(waveform)) + 1e-8
+        max_out = torch.max(torch.abs(out)) + 1e-8
+        out = out / max_out * max_orig
+        # Crop to original length
+        return out[..., :waveform.shape[-1]]
+
+    def random_noise(self, waveform):
+        """Add Gaussian noise."""
+        cfg = self._aug_cfg('random_noise')
+        noise_std = cfg.get('noise_std', 0.001)
+        return waveform + torch.randn_like(waveform) * noise_std
+
+    def pink_noise_aug(self, waveform):
+        """Add pink background noise."""
+        cfg = self._aug_cfg('pink_noise')
+        noise_std = cfg.get('noise_std', 0.01)
+        noise = generate_pink_noise(waveform.shape[-1]) * noise_std
+        return waveform + noise.unsqueeze(0).to(waveform.device)
+
+    def lowpass_filter(self, waveform):
+        """Apply lowpass filter."""
+        cfg = self._aug_cfg('lowpass_filter')
+        cutoff = cfg.get('cutoff_freq', 5000)
+        return julius.lowpass_filter(waveform, cutoff=cutoff / self.sample_rate)
+
+    def highpass_filter(self, waveform):
+        """Apply highpass filter."""
+        cfg = self._aug_cfg('highpass_filter')
+        cutoff = cfg.get('cutoff_freq', 500)
+        return julius.highpass_filter(waveform, cutoff=cutoff / self.sample_rate)
+
+    def bandpass_filter(self, waveform):
+        """Apply bandpass filter."""
+        cfg = self._aug_cfg('bandpass_filter')
+        low = cfg.get('cutoff_freq_low', 300)
+        high = cfg.get('cutoff_freq_high', 8000)
+        return julius.bandpass_filter(
+            waveform,
+            cutoff_low=low / self.sample_rate,
+            cutoff_high=high / self.sample_rate,
+        )
+
+    def smooth(self, waveform):
+        """Smooth via moving-average convolution."""
+        cfg = self._aug_cfg('smooth')
+        wr = cfg.get('window_size_range', [2, 10])
+        window_size = random.randint(int(wr[0]), int(wr[1]))
+        kernel = torch.ones(1, 1, window_size, dtype=waveform.dtype,
+                            device=waveform.device) / window_size
+        out = fft_conv1d(waveform.unsqueeze(0), kernel).squeeze(0)
+        # Pad to original length
+        result = torch.zeros_like(waveform)
+        result[..., :out.shape[-1]] = out
+        return result
+
+    def boost_audio(self, waveform):
+        """Amplify signal by a percentage."""
+        cfg = self._aug_cfg('boost_audio')
+        amount = cfg.get('amount', 20)
+        return waveform * (1 + amount / 100)
+
+    def duck_audio(self, waveform):
+        """Attenuate signal by a percentage."""
+        cfg = self._aug_cfg('duck_audio')
+        amount = cfg.get('amount', 20)
+        return waveform * (1 - amount / 100)
+
+    def updownresample(self, waveform):
+        """Upsample then downsample to introduce resampling artifacts."""
+        cfg = self._aug_cfg('updownresample')
+        intermediate = cfg.get('intermediate_freq', 32000)
+        up = resample_frac(waveform, self.sample_rate, intermediate)
+        return resample_frac(up, intermediate, self.sample_rate)[..., :waveform.shape[-1]]
+
     def __call__(self, waveform):
         if self.available:
             # Randomly sample 0 to min(4, len(available)) augmentations
-            k = random.randint(0, min(4, len(self.available)))
+            k = random.randint(0, min(self.max_augs, len(self.available)))
             selected = random.sample(self.available, k)
             for aug_fn in selected:
                 waveform = aug_fn(waveform)
