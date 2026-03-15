@@ -37,7 +37,6 @@ import pyroomacoustics as pra
 
 class AugmentationPipeline:
     def __init__(self, sample_rate=16000, config=None, noise_dir=None):
-    def __init__(self, sample_rate=16000, config=None, noise_dir=None):
         self.sample_rate = sample_rate
         self.config = config or {}
         self.max_augs = self.config.get('max_augs', 4)  # number of augmentations to apply per sample
@@ -248,15 +247,6 @@ class AugmentationPipeline:
         else:
             noise = torch.randn_like(waveform)
 
-        """Mix with real background noise (DNS challenge) at SNR in [5, 15] dB.
-        Falls back to Gaussian noise if no noise files are available."""
-        snr_db = random.uniform(5.0, 15.0)
-
-        if self.noise_files:
-            noise = self._load_noise(waveform.shape[-1]).to(waveform.device)
-        else:
-            noise = torch.randn_like(waveform)
-
         signal_power = waveform.norm(p=2)
         noise_power = noise.norm(p=2)
         if noise_power == 0:
@@ -289,14 +279,14 @@ class AudioDataset(Dataset):
     """
 
     def __init__(self, root, split="train", augment=False, config=None,
-                 target_sr=16000, max_length=None, noise_dir=None, noise_dir=None):
+                 target_sr=16000, max_length=None, noise_dir=None):
         self.root = root
         self.split = split
         self.augment = augment
         self.target_sr = target_sr
         self.max_length = max_length  # max samples; None = no truncation
         self.augmenter = AugmentationPipeline(
-            sample_rate=target_sr, config=config, noise_dir=noise_dir, noise_dir=noise_dir
+            sample_rate=target_sr, config=config, noise_dir=noise_dir
         ) if augment else None
         self.files = self._load_files()
 
