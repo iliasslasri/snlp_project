@@ -1,7 +1,20 @@
 import torch
 import torchaudio
 import torchaudio.transforms as T
+import soundfile as _sf
+
 from torch.utils.data import Dataset
+
+
+def _load_audio(path: str) -> tuple[torch.Tensor, int]:
+    """Load audio via soundfile (avoids TorchCodec/FFmpeg on Windows)."""
+    data, sr = _sf.read(path, dtype="float32", always_2d=False)
+    waveform = torch.from_numpy(data)
+    if waveform.dim() == 1:
+        waveform = waveform.unsqueeze(0)   # [1, T]
+    else:
+        waveform = waveform.T              # [C, T]
+    return waveform, sr
 import random
 import os
 import glob
@@ -46,16 +59,9 @@ class AugmentationPipeline:
                 )
             self.rir_files.sort()
         
-        # Cache resamplers for fixed stretch rates
-        self.stretch_rates = [0.8, 0.85, 0.9, 0.95, 1.05, 1.1, 1.15, 1.2]
-        self.resamplers = {}
-        if self.config.get('time_stretch'):
-            for rate in self.stretch_rates:
-                new_freq = int(self.sample_rate * rate)
-                self.resamplers[rate] = (
-                    T.Resample(orig_freq=self.sample_rate, new_freq=new_freq),
-                    T.Resample(orig_freq=new_freq, new_freq=self.sample_rate)
-                )
+        # Phase Vocoder parameters for time stretch
+        self.pv_n_fft = 1024
+        self.pv_hop_length = 256
                 
         # Cache pitch shifters
         self.pitch_shifters = {}
@@ -106,15 +112,41 @@ class AugmentationPipeline:
         return getattr(cfg, 'enabled', False)
             
     def time_stretch(self, waveform):
-        """Apply random time stretching by resampling at a perturbed rate."""
-        rate = random.choice(self.stretch_rates)
+        """Time stretch using Phase Vocoder — changes tempo, preserves pitch."""
+        rate = random.uniform(0.8, 1.2)
+        if abs(rate - 1.0) < 0.01:
+            return waveform
+
+        device = waveform.device
+        window = torch.hann_window(self.pv_n_fft, device=device)
+
+        # 1. STFT → true complex spectrogram [freq, time]
+        spec = torch.stft(
+            waveform.squeeze(0),
+            n_fft=self.pv_n_fft,
+            hop_length=self.pv_hop_length,
+            window=window,
+            return_complex=True,
+        )
+
+        # 2. Apply Time Stretch using Torchaudio's built-in transform
+        # This safely handles the phase advance calculations and native complex types
+        stretch_transform = T.TimeStretch(
+            hop_length=self.pv_hop_length, 
+            n_freq=spec.shape[0]
+        ).to(device)
         
-        # Simple resampling to approximate time stretching / speed change
-        resample_down, resample_up = self.resamplers[rate]
-        stretched = resample_down(waveform)
-        
-        # Resample back to original rate to fit shapes (pitch and speed change)
-        return resample_up(stretched)
+        # TimeStretch expects batched input [..., freq, time]
+        stretched_spec = stretch_transform(spec.unsqueeze(0), overriding_rate=rate).squeeze(0)
+
+        # 3. ISTFT → waveform [time']
+        stretched = torch.istft(
+            stretched_spec,
+            n_fft=self.pv_n_fft,
+            hop_length=self.pv_hop_length,
+            window=window,
+        )
+        return stretched.unsqueeze(0)  # [1, time']
 
     def pitch_shift(self, waveform):
         """Apply random pitch shifting using torchaudio.transforms."""
@@ -132,7 +164,7 @@ class AugmentationPipeline:
         # Fast path: use offline RIRs
         if self.rir_files:
             rir_path = random.choice(self.rir_files)
-            rir, sr = torchaudio.load(rir_path)
+            rir, sr = _load_audio(rir_path)
             
             # Resample RIR if necessary
             if sr != self.sample_rate:
@@ -215,7 +247,7 @@ class AugmentationPipeline:
     def _load_noise(self, target_length):
         """Load a random noise clip, loop/crop to match target_length samples."""
         noise_path = random.choice(self.noise_files)
-        noise, sr = torchaudio.load(noise_path)
+        noise, sr = _load_audio(noise_path)
         # Convert to mono
         if noise.shape[0] > 1:
             noise = noise.mean(dim=0, keepdim=True)
@@ -446,7 +478,7 @@ class AudioDataset(Dataset):
 
     def __getitem__(self, idx):
         file_path = self.files[idx]
-        waveform, sample_rate = torchaudio.load(file_path)
+        waveform, sample_rate = _load_audio(file_path)
 
         # Convert to mono if multi-channel
         if waveform.shape[0] > 1:

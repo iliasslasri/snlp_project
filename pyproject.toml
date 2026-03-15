@@ -3,7 +3,7 @@ name = "snlp-project"
 version = "0.1.0"
 description = "Robust speech representation learning"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 license = "MIT"
 dependencies = [
   "aiohttp>=3.13.3",
@@ -19,11 +19,12 @@ dependencies = [
   "setuptools<70.0",
   "soundfile>=0.12.0",
   "tensorboard>=2.16.0",
-  "torch==2.1.2",
-  "torchaudio==2.1.2",
+  "torch>=2.1.2",
+  "torchaudio>=2.1.2",
   "transformers>=4.30.0",
   "pyroomacoustics",
   "julius",
+  "editdistance>=0.8.1",
 ]
 
 [dependency-groups]
@@ -31,6 +32,21 @@ dev = [
   "ipykernel>=7.2.0",
   "ruff>=0.15.0",
 ]
+eval = [
+  "fastabx",
+]
+
+[tool.uv.sources]
+# Install fastabx from the local git submodule (already cloned in fastabx/)
+fastabx = { path = "fastabx", editable = true }
+torch = { index = "pytorch-cu130" }
+torchvision = { index = "pytorch-cu130" }
+torchaudio = { index = "pytorch-cu130" }
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
 
 [build-system]
 requires = ["flit_core>=3.2,<4"]
