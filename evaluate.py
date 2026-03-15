@@ -113,7 +113,7 @@ def parse_args() -> argparse.Namespace:
     model.add_argument("--vocab-size", type=int, default=500)
     model.add_argument("--hidden-dim", type=int, default=256)
     model.add_argument("--hubert-name", default="hubert-base-ls960")
-    model.add_argument("--hubert-layer", type=int, default=9)
+    model.add_argument("--hubert-layer", type=int, default=6)
 
     # Data (for ued)
     data = p.add_argument_group("Data (for --metrics ued)")

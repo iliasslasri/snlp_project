@@ -123,7 +123,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--vocab-size", type=int, default=500)
     p.add_argument("--hidden-dim", type=int, default=256)
     p.add_argument("--hubert-name", default="hubert-base-ls960")
-    p.add_argument("--hubert-layer", type=int, default=9)
+    p.add_argument("--hubert-layer", type=int, default=6)
 
     # Data
     p.add_argument("--data-root", default="data/LibriSpeech")

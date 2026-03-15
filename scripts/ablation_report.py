@@ -87,7 +87,7 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--hidden-dim", type=int, default=256)
     p.add_argument("--hubert-name", default="hubert-base-ls960")
-    p.add_argument("--hubert-layer", type=int, default=9)
+    p.add_argument("--hubert-layer", type=int, default=6)
     p.add_argument("--data-root", default="LibriSpeech")
     p.add_argument("--split", default="test-clean")
     p.add_argument("--noise-dir", default=None)
