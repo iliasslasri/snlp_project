@@ -1,3 +1,6 @@
 [submodule "speech_encoder"]
 	path = speech_encoder
 	url = https://github.com/mxmpl/speech_encoder
+[submodule "fastabx"]
+	path = fastabx
+	url = https://github.com/bootphon/fastabx.git
