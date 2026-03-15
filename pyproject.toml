@@ -24,6 +24,9 @@ dependencies = [
   "transformers>=4.30.0",
   "pyroomacoustics",
   "julius",
+  "joblib>=1.5.3",
+  "fsspec>=2026.2.0",
+  "scikit-learn>=1.8.0",
 ]
 
 [dependency-groups]

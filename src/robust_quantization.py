@@ -19,7 +19,6 @@ from .dataset import AudioDataset
 def create_speech_encoder(cfg, device):
     """Loads E0 (SpeechEncoder) with HuBERT + KMeans."""
     logging.info(f"Loading continuous encoder and KMeans for '{cfg.model.name}'...")
-    # SpeechEncoder from the library loads the dense model and the quantizer
     return SpeechEncoder.from_textlesslib(
         name=cfg.model.name,
         layer=cfg.model.layer,
@@ -138,7 +137,55 @@ def train_quantizer(cfg):
     base_checkpoint_dir = cfg.training.checkpoint_dir
     prev_E1 = None  # teacher for rounds > 0
 
-    for round_idx in range(total_rounds):
+    start_round = 0
+    start_epoch = 0
+    best_loss = float('inf')
+    checkpoint = None
+    resume_path = cfg.training.get("resume_from", None)
+
+    if resume_path is not None and os.path.isfile(resume_path):
+        logging.info(f"Resuming from checkpoint: {resume_path}")
+        checkpoint = torch.load(resume_path, map_location=device)
+        
+        start_round = checkpoint.get('round_idx', 0)
+        start_epoch = checkpoint.get('epoch', -1) + 1
+        best_loss = checkpoint.get('best_loss', float('inf'))
+        logging.info(f"  Resuming at Round {start_round}, Epoch {start_epoch}, best_loss={best_loss:.4f}")
+
+        # Restore random states
+        if 'rng_state' in checkpoint:
+            torch.set_rng_state(checkpoint['rng_state'].cpu())
+        if 'cuda_rng_state' in checkpoint and torch.cuda.is_available():
+            torch.cuda.set_rng_state(checkpoint['cuda_rng_state'].cpu())
+        if 'random_state' in checkpoint:
+            random.setstate(checkpoint['random_state'])
+
+        # If resuming a round > 0, we must load the previous round's best model to act as the teacher
+        if start_round > 0:
+            prev_round_dir = os.path.join(base_checkpoint_dir, f"round_{start_round - 1}")
+            prev_best_ckpt = os.path.join(prev_round_dir, "E1_best.pt")
+            
+            if not os.path.isfile(prev_best_ckpt):
+                # Try relative to the resume path if not found in current checkpoint dir
+                resume_root = os.path.dirname(os.path.dirname(resume_path))
+                prev_best_ckpt = os.path.join(resume_root, f"round_{start_round - 1}", "E1_best.pt")
+                logging.info(f"  Teacher not found in current experiment dir. Trying resumed experiment dir: {prev_best_ckpt}")
+
+            if os.path.isfile(prev_best_ckpt):
+                logging.info(f"  Loading teacher (prev_E1) from {prev_best_ckpt}")
+                prev_E1 = RobustQuantizer(
+                    input_dim=768,
+                    hidden_dim=cfg.model.quantizer.hidden_dim,
+                    num_codes=vocab_size + 1,
+                ).to(device)
+                prev_ckpt_data = torch.load(prev_best_ckpt, map_location=device)
+                prev_E1.load_state_dict(prev_ckpt_data['model_state_dict'])
+                prev_E1.eval()
+            else:
+                raise FileNotFoundError(f"Cannot resume round {start_round}. Missing teacher checkpoint: {prev_best_ckpt}")
+
+    # Start loop from start_round
+    for round_idx in range(start_round, total_rounds):
         logging.info(f"=== Round {round_idx}/{total_rounds - 1} ===")
 
         round_dir = os.path.join(base_checkpoint_dir, f"round_{round_idx}")
@@ -156,28 +203,25 @@ def train_quantizer(cfg):
 
         tensorboard_dir = os.path.join(round_dir, "tensorboard")
         writer = SummaryWriter(log_dir=tensorboard_dir)
-
-        best_loss = float('inf')
-        start_epoch = 0
-
-        # Resume from checkpoint (only round 0)
-        if round_idx == 0:
-            resume_path = cfg.training.get("resume_from", None)
-            if resume_path is not None:
-                logging.info(f"Resuming from checkpoint: {resume_path}")
-                checkpoint = torch.load(resume_path, map_location=device)
-                E1.load_state_dict(checkpoint['model_state_dict'])
-                optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-                start_epoch = checkpoint['epoch'] + 1
-                best_loss = checkpoint.get('best_loss', float('inf'))
-                logging.info(f"  Resumed at epoch {start_epoch}, best_loss={best_loss:.4f}")
+        
+        # Apply checkpoint state ONLY if this is the round we are resuming
+        if round_idx == start_round and checkpoint is not None:
+            E1.load_state_dict(checkpoint['model_state_dict'])
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        else:
+            # For subsequent rounds or if not resuming, reset counters
+            start_epoch = 0
+            best_loss = float('inf')
 
         scheduler = None
         if cfg.training.lr_scheduler is not None:
             scheduler = hydra.utils.instantiate(cfg.training.lr_scheduler, optimizer=optimizer)
+            if round_idx == start_round and checkpoint is not None and 'scheduler_state_dict' in checkpoint:
+                logging.info("  Resuming scheduler state.")
+                scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
 
         epoch = start_epoch
-        for epoch in range(start_epoch, cfg.training.epochs + start_epoch):
+        for epoch in range(start_epoch, cfg.training.epochs):
             E1.train()
             total_loss = 0.0
             
@@ -249,24 +293,32 @@ def train_quantizer(cfg):
                 scheduler.step()
             logging.info(f"--- [Round {round_idx}] Epoch {epoch} Complete | Avg CTC Loss: {avg_loss:.4f} ---")
             
+            checkpoint_state = {
+                'round_idx': round_idx,
+                'epoch': epoch,
+                'model_state_dict': E1.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'best_loss': best_loss,
+                'rng_state': torch.get_rng_state(),
+                'random_state': random.getstate(),
+            }
+            if torch.cuda.is_available():
+                checkpoint_state['cuda_rng_state'] = torch.cuda.get_rng_state()
+            if scheduler is not None:
+                checkpoint_state['scheduler_state_dict'] = scheduler.state_dict()
+
             # Save best model
             if avg_loss < best_loss:
                 best_loss = avg_loss
-                torch.save({
-                    'epoch': epoch,
-                    'model_state_dict': E1.state_dict(),
-                    'optimizer_state_dict': optimizer.state_dict(),
-                    'best_loss': best_loss,
-                }, os.path.join(round_dir, "E1_best.pt"))
-                logging.info(f"    New best model saved (loss={best_loss:.4f})")
-
-        # Save last model
-        torch.save({
-            'epoch': epoch,
-            'model_state_dict': E1.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
-            'best_loss': best_loss,
-        }, os.path.join(round_dir, "E1_last.pt"))
+                checkpoint_state['best_loss'] = best_loss # Update the dict with the new best
+                torch.save(checkpoint_state, os.path.join(round_dir, "E1_best.pt"))
+                logging.info(f"New best model saved (loss={best_loss:.4f})")
+            
+            torch.save(checkpoint_state, os.path.join(round_dir, "E1_last.pt"))
+            
+            if not os.path.isfile(os.path.join(round_dir, "E1_best.pt")):
+                torch.save(checkpoint_state, os.path.join(round_dir, "E1_best.pt"))
+                logging.info("Saved fallback E1_best.pt at end of training.")
         writer.close()
 
         # After convergence, this E1 becomes the teacher for the next round
