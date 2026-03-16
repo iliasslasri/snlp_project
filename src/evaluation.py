@@ -141,7 +141,7 @@ class UEDEvaluator:
     def evaluate_augmentation(
         self,
         root: str,
-        split: str,
+        splits: Union[str, List[str]],
         augmentation_name: str,
         base_aug_config: DictConfig,
         noise_dir: Optional[str] = None,
@@ -157,7 +157,7 @@ class UEDEvaluator:
 
         Args:
             root:               LibriSpeech root directory.
-            split:              Dataset split (e.g. 'test-clean').
+            splits:             Dataset split(s) (e.g. 'test-clean' or ['test-clean', 'test-other']).
             augmentation_name:  Key of the augmentation to isolate
                                 (e.g. 'time_stretch', 'pitch_shift',
                                 'reverberation', 'noise').
@@ -171,24 +171,38 @@ class UEDEvaluator:
         Returns:
             Dict with 'mean_ued' and 'std_ued'.
         """
-        aug_config = _build_single_aug_config(augmentation_name, base_aug_config)
-        dataset: Union[AudioDataset, Subset] = AudioDataset(
-            root=root,
-            split=split,
-            augment=True,
-            config=aug_config,
-            noise_dir=noise_dir,
-            max_length=max_length,
-        )
+        # Handle both single string and list of splits
+        if isinstance(splits, str):
+            splits = [splits]
 
-        if n_samples is not None and n_samples < len(dataset):
-            indices = torch.randperm(len(dataset))[:n_samples].tolist()
-            dataset = Subset(dataset, indices)
+        aug_config = _build_single_aug_config(augmentation_name, base_aug_config)
+
+        # Create datasets for each split and combine them
+        datasets = []
+        for split in splits:
+            dataset = AudioDataset(
+                root=root,
+                split=split,
+                augment=True,
+                config=aug_config,
+                noise_dir=noise_dir,
+                max_length=max_length,
+            )
+            datasets.append(dataset)
+
+        # Combine all datasets
+        from torch.utils.data import ConcatDataset
+        combined_dataset: Union[ConcatDataset, Subset] = ConcatDataset(datasets)
+
+        if n_samples is not None and n_samples < len(combined_dataset):
+            indices = torch.randperm(len(combined_dataset))[:n_samples].tolist()
+            combined_dataset = Subset(combined_dataset, indices)
 
         logger.info(
-            f"Evaluating UED for '{augmentation_name}' on {len(dataset)} samples …"
+            f"Evaluating UED for '{augmentation_name}' on {len(combined_dataset)} samples "
+            f"from split(s): {'+'.join(splits)} …"
         )
-        return self.evaluate_dataset(dataset, batch_size=batch_size, num_workers=num_workers)
+        return self.evaluate_dataset(combined_dataset, batch_size=batch_size, num_workers=num_workers)
 
 
 # ---------------------------------------------------------------------------
@@ -242,7 +256,7 @@ class BaselineUEDEvaluator:
     def evaluate_augmentation(
         self,
         root: str,
-        split: str,
+        splits: Union[str, List[str]],
         augmentation_name: str,
         base_aug_config: DictConfig,
         noise_dir: Optional[str] = None,
@@ -251,13 +265,38 @@ class BaselineUEDEvaluator:
         batch_size: int = 8,
         num_workers: int = 0,
     ) -> Dict[str, float]:
+        # Handle both single string and list of splits
+        if isinstance(splits, str):
+            splits = [splits]
+
         aug_config = _build_single_aug_config(augmentation_name, base_aug_config)
-        dataset = AudioDataset(root=root, split=split, augment=True, config=aug_config, noise_dir=noise_dir, max_length=max_length)
-        if n_samples is not None and n_samples < len(dataset):
-            indices = torch.randperm(len(dataset))[:n_samples].tolist()
-            dataset = Subset(dataset, indices)
-        logger.info(f"Evaluating baseline UED for '{augmentation_name}' on {len(dataset)} samples …")
-        return self.evaluate_dataset(dataset, batch_size=batch_size, num_workers=num_workers)
+
+        # Create datasets for each split and combine them
+        datasets = []
+        for split in splits:
+            dataset = AudioDataset(
+                root=root,
+                split=split,
+                augment=True,
+                config=aug_config,
+                noise_dir=noise_dir,
+                max_length=max_length,
+            )
+            datasets.append(dataset)
+
+        # Combine all datasets
+        from torch.utils.data import ConcatDataset
+        combined_dataset: Union[ConcatDataset, Subset] = ConcatDataset(datasets)
+
+        if n_samples is not None and n_samples < len(combined_dataset):
+            indices = torch.randperm(len(combined_dataset))[:n_samples].tolist()
+            combined_dataset = Subset(combined_dataset, indices)
+
+        logger.info(
+            f"Evaluating baseline UED for '{augmentation_name}' on {len(combined_dataset)} samples "
+            f"from split(s): {'+'.join(splits)} …"
+        )
+        return self.evaluate_dataset(combined_dataset, batch_size=batch_size, num_workers=num_workers)
 
 
 # ---------------------------------------------------------------------------
