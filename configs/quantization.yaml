@@ -1,11 +1,25 @@
 defaults:
   - _self_
 
+training:
+  run_name: "new_aug"
+  epochs: 25
+  learning_rate: 1e-4
+  log_interval: 100
+  checkpoint_dir: null
+  resume_from: null
+  n_iterative_pseudolabeling: 3 # set > 0 for iterative training
+  lr_scheduler:
+    _target_: "torch.optim.lr_scheduler.CosineAnnealingLR"
+    T_max: 25
+    eta_min: 1e-6
+  lr_scheduler_start_epoch: 10
+
 dataset:
   root: "data/LibriSpeech"
   train_split: "train-clean-100"
   test_split: "test-clean"
-  batch_size: 16 
+  batch_size: 48 # 48 # 32, 56
   num_workers: 1
   noise_dir: "noise_fullband"
   max_audio_length: 160000  # 10s at 16kHz
@@ -51,24 +65,11 @@ dataset:
 
 model:
   name: "hubert-base-ls960"
-  layer: 9
+  layer: 6
   vocab_size: 500
   kind_kmeans: "kmeans"
   quantizer:
     hidden_dim: 256
-
-training:
-  epochs: 25
-  learning_rate: 1e-4
-  log_interval: 100
-  checkpoint_dir: "checkpoints/quantizer"
-  resume_from: null
-  n_iterative_pseudolabeling: 3 # set > 0 for iterative training
-  lr_scheduler:
-    _target_: "torch.optim.lr_scheduler.CosineAnnealingLR"
-    T_max: 25
-    eta_min: 1e-6
-  lr_scheduler_start_epoch: 10
 
 hydra:
   run:
