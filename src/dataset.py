@@ -256,6 +256,11 @@ class AugmentationPipeline:
         return waveform + scale * noise
 
     def __call__(self, waveform):
+        """Apply random augmentations (for training).
+
+        Randomly samples k augmentations from available set, where k ~ Uniform(0, min(4, len(available))).
+        This is the intended behavior for training to create diverse augmented samples.
+        """
         if self.available:
             # Randomly sample 0 to min(4, len(available)) augmentations
             k = random.randint(0, min(4, len(self.available)))
@@ -263,6 +268,19 @@ class AugmentationPipeline:
             for aug_fn in selected:
                 waveform = aug_fn(waveform)
 
+        return waveform
+
+    def apply_deterministic(self, waveform):
+        """Apply ALL available augmentations deterministically (for evaluation).
+
+        During evaluation, the config should have only ONE augmentation enabled.
+        This method applies that single augmentation to 100% of samples (no random sampling).
+        This matches the paper's evaluation protocol where each augmentation is tested individually.
+        """
+        if self.available:
+            # Apply all available augmentations (during eval, only 1 should be enabled)
+            for aug_fn in self.available:
+                waveform = aug_fn(waveform)
         return waveform
 
 
@@ -279,10 +297,12 @@ class AudioDataset(Dataset):
     """
 
     def __init__(self, root, split="train", augment=False, config=None,
-                 target_sr=16000, max_length=None, noise_dir=None):
+                 target_sr=16000, max_length=None, noise_dir=None,
+                 deterministic_aug=False):
         self.root = root
         self.split = split
         self.augment = augment
+        self.deterministic_aug = deterministic_aug  # If True, apply augmentations deterministically (for evaluation)
         self.target_sr = target_sr
         self.max_length = max_length  # max samples; None = no truncation
         self.augmenter = AugmentationPipeline(
@@ -366,7 +386,12 @@ class AudioDataset(Dataset):
 
         if self.augment and self.augmenter:
             with torch.no_grad():
-                augmented_waveform = self.augmenter(waveform)
+                if self.deterministic_aug:
+                    # Evaluation mode: apply augmentation deterministically (100% of samples)
+                    augmented_waveform = self.augmenter.apply_deterministic(waveform)
+                else:
+                    # Training mode: apply random subset of augmentations
+                    augmented_waveform = self.augmenter(waveform)
             return clean_waveform.detach(), augmented_waveform.detach()
 
         return clean_waveform.detach()

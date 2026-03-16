@@ -187,6 +187,7 @@ class UEDEvaluator:
                 config=aug_config,
                 noise_dir=noise_dir,
                 max_length=max_length,
+                deterministic_aug=True,  # CRITICAL: Apply augmentation to 100% of samples during evaluation
             )
             datasets.append(dataset)
 
@@ -281,6 +282,7 @@ class BaselineUEDEvaluator:
                 config=aug_config,
                 noise_dir=noise_dir,
                 max_length=max_length,
+                deterministic_aug=True,  # CRITICAL: Apply augmentation to 100% of samples during evaluation
             )
             datasets.append(dataset)
 
