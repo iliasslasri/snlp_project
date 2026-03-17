@@ -1,5 +1,6 @@
 import torch
 import torchaudio
+
 import torchaudio.transforms as T
 from torch.utils.data import Dataset
 import random
@@ -9,6 +10,19 @@ import numpy as np
 import julius
 from julius import fft_conv1d, resample_frac
 import pyroomacoustics as pra
+import soundfile as sf
+import os
+
+
+def load_audio(file_path: str) -> tuple[torch.Tensor, int]:
+    data, samplerate = sf.read(file_path, dtype="float32")
+    tensor = torch.from_numpy(data)
+    if tensor.ndim == 1:
+        tensor = tensor.unsqueeze(0)  # [1, time]
+    else:
+        tensor = tensor.transpose(0, 1)  # [channel, time]
+    return tensor, samplerate
+
 
 
 def generate_pink_noise(length: int) -> torch.Tensor:
@@ -151,7 +165,7 @@ class AugmentationPipeline:
         # Fast path: use offline RIRs
         if self.rir_files:
             rir_path = random.choice(self.rir_files)
-            rir, sr = torchaudio.load(rir_path)
+            rir, sr = load_audio(rir_path)
             
             # Resample RIR if necessary
             if sr != self.sample_rate:
@@ -234,7 +248,7 @@ class AugmentationPipeline:
     def _load_noise(self, target_length):
         """Load a random noise clip, loop/crop to match target_length samples."""
         noise_path = random.choice(self.noise_files)
-        noise, sr = torchaudio.load(noise_path)
+        noise, sr = load_audio(noise_path)
         # Convert to mono
         if noise.shape[0] > 1:
             noise = noise.mean(dim=0, keepdim=True)
@@ -465,7 +479,7 @@ class AudioDataset(Dataset):
 
     def __getitem__(self, idx):
         file_path = self.files[idx]
-        waveform, sample_rate = torchaudio.load(file_path)
+        waveform, sample_rate = load_audio(file_path)
 
         # Convert to mono if multi-channel
         if waveform.shape[0] > 1:

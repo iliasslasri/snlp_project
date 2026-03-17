@@ -19,8 +19,8 @@ dependencies = [
   "setuptools<70.0",
   "soundfile>=0.12.0",
   "tensorboard>=2.16.0",
-  "torch>=2.1.2",
-  "torchaudio>=2.1.2",
+  "torch>=2.5.1",
+  "torchaudio>=2.5.1",
   "transformers>=4.30.0",
   "pyroomacoustics",
   "julius",
@@ -35,20 +35,19 @@ dev = [
   "ipykernel>=7.2.0",
   "ruff>=0.15.0",
 ]
-eval = [
-  "fastabx",
-]
+# eval = [
+#   "fastabx",
+# ]
 
 [tool.uv.sources]
 # Install fastabx from the local git submodule (already cloned in fastabx/)
-fastabx = { path = "fastabx", editable = true }
-torch = { index = "pytorch-cu130" }
-torchvision = { index = "pytorch-cu130" }
-torchaudio = { index = "pytorch-cu130" }
+# fastabx = { path = "fastabx", editable = true }
+torch = { index = "pytorch-cu124" }
+torchaudio = { index = "pytorch-cu124" }
 
 [[tool.uv.index]]
-name = "pytorch-cu130"
-url = "https://download.pytorch.org/whl/cu130"
+name = "pytorch-cu124"
+url = "https://download.pytorch.org/whl/cu124"
 explicit = true
 
 [build-system]
