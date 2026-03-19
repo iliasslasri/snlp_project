@@ -19,7 +19,7 @@ dataset:
   root: "data/LibriSpeech"
   train_split: "train-clean-100"
   test_split: "test-clean"
-  batch_size: 48 # 48 # 32, 56
+  batch_size: 32
   num_workers: 1
   noise_dir: "noise_fullband"
   max_audio_length: 160000  # 10s at 16kHz
