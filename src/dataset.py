@@ -40,6 +40,7 @@ class AugmentationPipeline:
         self.config = config or {}
         self.max_augs = self.config.get('max_augs', 4)  # number of augmentations to apply per sample
                                                 # we sample k ~ Uniform(0, n_aug) augmentations to apply per sample
+        self.multiple_augs = self.config.get('multiple_augs', True)
 
         # Scan noise directory for background noise files (DNS challenge)
         self.noise_files = []
@@ -389,9 +390,13 @@ class AugmentationPipeline:
 
     def __call__(self, waveform):
         if self.available:
-            # Randomly sample 0 to min(4, len(available)) augmentations
-            k = random.randint(0, min(self.max_augs, len(self.available)))
-            selected = random.sample(self.available, k)
+            if self.multiple_augs:
+                # Randomly sample 0 to min(max_augs, len(available)) augmentations
+                k = random.randint(0, min(self.max_augs, len(self.available)))
+            else:
+                k = 1
+                
+            selected = random.sample(self.available, min(k, len(self.available)))
             for aug_fn in selected:
                 waveform = aug_fn(waveform)
 
