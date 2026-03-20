@@ -340,3 +340,5 @@ uv run python scripts/ablation_report.py --checkpoints checkpoints/quantizer/E1_
 | `torchdtw` | Internal to fastabx | Installed automatically with fastabx |
 | `pyroomacoustics` | Reverberation simulation | On-the-fly RIR generation |
 | `soundfile` | Audio I/O | Replaces `torchaudio.load` (avoids TorchCodec/FFmpeg on Windows) |
+
+tmux attach -t eval

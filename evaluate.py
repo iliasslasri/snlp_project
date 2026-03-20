@@ -11,12 +11,19 @@ Each metric can be run independently. By default all enabled metrics run.
 
 Examples
 --------
-# UED only (fastest, the core robustness metric)
+# UED only, 500 samples per augmentation
 uv run python evaluate.py \\
     --metrics ued \\
     --checkpoint checkpoints/quantizer/round_0/E1_best.pt \\
     --data-root data/LibriSpeech --split test-clean \\
     --noise-dir noise_fullband --n-samples 500
+
+# UED on combined splits, full dataset (as in paper)
+uv run python evaluate.py \\
+    --metrics ued \\
+    --checkpoint checkpoints/quantizer/round_0/E1_best.pt \\
+    --data-root data/LibriSpeech --split test-clean test-other \\
+    --noise-dir noise_fullband
 
 # ABX only (no E1 checkpoint needed, only HuBERT features)
 uv run python evaluate.py \\
@@ -120,15 +127,16 @@ def parse_args() -> argparse.Namespace:
     data.add_argument("--data-root", default="data/LibriSpeech")
     data.add_argument(
         "--split",
-        default="test-clean",
-        help="Dataset split, e.g. test-clean or test-other.",
+        nargs="+",
+        default=["test-clean"],
+        help="Dataset split(s), e.g. test-clean or 'test-clean test-other' for combined evaluation.",
     )
     data.add_argument("--noise-dir", default=None, help="DNS noise directory (for 'noise' aug).")
     data.add_argument(
         "--n-samples",
         type=int,
-        default=500,
-        help="Samples per augmentation. Set to 0 for the full split.",
+        default=0,
+        help="Samples per augmentation. Set to 0 or omit for the full split. Default: 0 (full split).",
     )
     data.add_argument("--batch-size", type=int, default=8)
     data.add_argument("--num-workers", type=int, default=0)
@@ -321,7 +329,7 @@ def run_ued(args: argparse.Namespace, device: torch.device) -> dict:
             try:
                 metrics = baseline_evaluator.evaluate_augmentation(
                     root=args.data_root,
-                    split=args.split,
+                    splits=args.split,
                     augmentation_name=aug_name,
                     base_aug_config=base_cfg,
                     noise_dir=args.noise_dir,
@@ -342,7 +350,7 @@ def run_ued(args: argparse.Namespace, device: torch.device) -> dict:
         try:
             metrics = evaluator.evaluate_augmentation(
                 root=args.data_root,
-                split=args.split,
+                splits=args.split,
                 augmentation_name=aug_name,
                 base_aug_config=base_cfg,
                 noise_dir=args.noise_dir,
@@ -425,9 +433,10 @@ _AUG_DISPLAY = {
 def _print_summary(results: dict, args: argparse.Namespace) -> None:
     sep = "=" * 62
     ckpt_label = args.checkpoint or "(no E1 checkpoint)"
+    split_label = "+".join(args.split) if isinstance(args.split, list) else args.split
     print(f"\n{sep}")
     print(f"  Evaluation — {ckpt_label}")
-    print(f"  Split: {args.split}  |  Metrics: {', '.join(args.metrics)}")
+    print(f"  Split: {split_label}  |  Metrics: {', '.join(args.metrics)}")
     print(sep)
 
     if "ued" in results:
