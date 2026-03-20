@@ -424,7 +424,6 @@ class AudioDataset(Dataset):
         self.max_length = max_length  # max samples; None = no truncation
         self.augmenter = AugmentationPipeline(
             sample_rate=target_sr, config=config, noise_dir=noise_dir
-            sample_rate=target_sr, config=config, noise_dir=noise_dir
         ) if augment else None
         self.files = self._load_files()
 
