@@ -23,14 +23,15 @@ dataset:
   num_workers: 1
   noise_dir: "noise_fullband"
   max_audio_length: 160000  # 10s at 16kHz
-  max_augs: 4  # number of augmentations to apply per sample; we sample k ~ Uniform(0, n_aug) augmentations to apply per sample
-  multiple_augs: false
   augmentations:
+    max_augs: 4  # number of augmentations to apply per sample; we sample k ~ Uniform(0, n_aug) augmentations to apply per sample
     time_stretch: true
     pitch_shift: true
     reverberation: true
     noise: true
     rir_dir: "data/rirs"
+    activate_extra_augs: true
+
     echo:
       enabled: true
       volume_range: [0.1, 0.5]

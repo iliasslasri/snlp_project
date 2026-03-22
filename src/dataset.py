@@ -38,9 +38,8 @@ class AugmentationPipeline:
     def __init__(self, sample_rate=16000, config=None, noise_dir=None):
         self.sample_rate = sample_rate
         self.config = config or {}
-        self.max_augs = self.config.get('max_augs', 4)  # number of augmentations to apply per sample
+        self.max_augs = self.config.get('max_augs')  # number of augmentations to apply per sample
                                                 # we sample k ~ Uniform(0, n_aug) augmentations to apply per sample
-        self.multiple_augs = self.config.get('multiple_augs', True)
 
         # Scan noise directory for background noise files (DNS challenge)
         self.noise_files = []
@@ -77,7 +76,14 @@ class AugmentationPipeline:
             self.available.append(self.time_stretch)
         if self.config.get('pitch_shift'):
             self.available.append(self.pitch_shift)
+        # Phase Vocoder parameters for time stretch
+        self.pv_n_fft = 1024
+        self.pv_hop_length = 256
+        
         # new augmentations
+        if not self.config.get('activate_extra_augs'):
+            return
+
         if self._aug_enabled('echo'):
             self.available.append(self.echo)
         if self._aug_enabled('random_noise'):
@@ -99,9 +105,6 @@ class AugmentationPipeline:
         if self._aug_enabled('updownresample'):
             self.available.append(self.updownresample)
 
-        # Phase Vocoder parameters for time stretch
-        self.pv_n_fft = 1024
-        self.pv_hop_length = 256
         
     def _aug_enabled(self, name):
         """Check if an augmentation sub-config exists and has enabled=true."""
@@ -390,11 +393,8 @@ class AugmentationPipeline:
 
     def __call__(self, waveform):
         if self.available:
-            if self.multiple_augs:
-                # Randomly sample 0 to min(max_augs, len(available)) augmentations
-                k = random.randint(0, min(self.max_augs, len(self.available)))
-            else:
-                k = 1
+            # Randomly sample 0 to min(max_augs, len(available)) augmentations
+            k = random.randint(0, min(self.max_augs, len(self.available)))
                 
             selected = random.sample(self.available, min(k, len(self.available)))
             for aug_fn in selected:
