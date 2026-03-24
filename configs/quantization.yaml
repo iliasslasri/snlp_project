@@ -3,12 +3,14 @@ defaults:
 
 training:
   run_name: "new_aug"
-  epochs: 150
+  epochs: 200
   learning_rate: 1e-4
   log_interval: 100
   checkpoint_dir: null
-  resume_from: null
+  resume_from: null # Resume from a mid-epoch checkpoint (takes priority over cfg start_round)
   n_iterative_pseudolabeling: 3 # set > 0 for iterative training
+  start_round: 0 # start iterative labeling from this round (0-indexed); must be <= n_iterative_pseudolabeling
+  teacher_checkpoint_path: null # path to E1_best.pt from round (start_round - 1); required when start_round > 0
   lr_scheduler:
     _target_: "torch.optim.lr_scheduler.CosineAnnealingLR"
     T_max: ${training.epochs}
