@@ -1,0 +1,21 @@
+defaults:
+  - _self_
+
+model:
+  name: "hubert-base-ls960"
+  layer: 6
+
+kmeans:
+  n_clusters: 500
+  batch_size: 256        # number of audio samples per MiniBatchKMeans partial_fit step
+  max_samples: null     # null = use entire dataset (LibriSpeech-960h)
+  seed: 42
+  log_interval: 50      # log inertia every N batches
+
+output:
+  dir: "outputs/kmeans"
+  save_name: "kmeans_model.joblib"
+
+hydra:
+  run:
+    dir: ${output.dir}/${now:%Y-%m-%d}/${now:%H-%M-%S}

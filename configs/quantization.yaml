@@ -3,7 +3,7 @@ defaults:
 
 training:
   run_name: "new_aug"
-  epochs: 200
+  epochs: 350
   learning_rate: 1e-4
   log_interval: 100
   checkpoint_dir: null
@@ -15,7 +15,7 @@ training:
     _target_: "torch.optim.lr_scheduler.CosineAnnealingLR"
     T_max: ${training.epochs}
     eta_min: 1e-6
-  lr_scheduler_start_epoch: 150
+  lr_scheduler_start_epoch: -1
 
 dataset:
   root: "data/LibriSpeech"
