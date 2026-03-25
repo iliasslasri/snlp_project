@@ -143,7 +143,12 @@ def train_quantizer(cfg):
     checkpoint = None
     resume_path = cfg.training.get("resume_from", None)
 
+    # Config-level start_round: begin from round n without a mid-epoch resume checkpoint
+    cfg_start_round = cfg.training["start_round"]
+    teacher_checkpoint_path = cfg.training["teacher_checkpoint_path"]
+
     if resume_path is not None and os.path.isfile(resume_path):
+        # Resume from a mid-epoch checkpoint (takes priority over cfg start_round) 
         logging.info(f"Resuming from checkpoint: {resume_path}")
         checkpoint = torch.load(resume_path, map_location=device)
         
@@ -162,9 +167,13 @@ def train_quantizer(cfg):
 
         # If resuming a round > 0, we must load the previous round's best model to act as the teacher
         if start_round > 0:
-            prev_round_dir = os.path.join(base_checkpoint_dir, f"round_{start_round - 1}")
-            prev_best_ckpt = os.path.join(prev_round_dir, "E1_best.pt")
-            
+            # Prefer explicitly provided teacher_checkpoint_path from config
+            prev_best_ckpt = teacher_checkpoint_path
+
+            if prev_best_ckpt is None or not os.path.isfile(prev_best_ckpt):
+                prev_round_dir = os.path.join(base_checkpoint_dir, f"round_{start_round - 1}")
+                prev_best_ckpt = os.path.join(prev_round_dir, "E1_best.pt")
+
             if not os.path.isfile(prev_best_ckpt):
                 # Try relative to the resume path if not found in current checkpoint dir
                 resume_root = os.path.dirname(os.path.dirname(resume_path))
@@ -183,6 +192,30 @@ def train_quantizer(cfg):
                 prev_E1.eval()
             else:
                 raise FileNotFoundError(f"Cannot resume round {start_round}. Missing teacher checkpoint: {prev_best_ckpt}")
+
+    elif cfg_start_round > 0:
+        # Config-level start: begin from round n with a provided teacher checkpoint 
+        if cfg_start_round >= total_rounds:
+            raise ValueError(
+                f"start_round ({cfg_start_round}) must be < total_rounds ({total_rounds}). "
+                f"Increase n_iterative_pseudolabeling or reduce start_round."
+            )
+        if teacher_checkpoint_path is None or not os.path.isfile(teacher_checkpoint_path):
+            raise FileNotFoundError(
+                f"start_round={cfg_start_round} requires a valid teacher_checkpoint_path. "
+                f"Got: {teacher_checkpoint_path!r}"
+            )
+        start_round = cfg_start_round
+        logging.info(f"Starting from round {start_round} (config-level). Loading teacher from {teacher_checkpoint_path}")
+        prev_E1 = RobustQuantizer(
+            input_dim=768,
+            hidden_dim=cfg.model.quantizer.hidden_dim,
+            num_codes=vocab_size + 1,
+        ).to(device)
+        prev_ckpt_data = torch.load(teacher_checkpoint_path, map_location=device)
+        prev_E1.load_state_dict(prev_ckpt_data['model_state_dict'])
+        prev_E1.eval()
+        logging.info(f"  Teacher (prev_E1) loaded from {teacher_checkpoint_path}")
 
     # Start loop from start_round
     for round_idx in range(start_round, total_rounds):
@@ -289,9 +322,9 @@ def train_quantizer(cfg):
 
             avg_loss = total_loss / len(dataloader)
             writer.add_scalar("Loss/CTC_Epoch", avg_loss, epoch)
-            if scheduler is not None and epoch >= cfg.training.lr_scheduler_start_epoch:
+            if scheduler is not None and cfg.training.lr_scheduler_start_epoch != -1 and epoch >= cfg.training.lr_scheduler_start_epoch:
                 scheduler.step()
-            logging.info(f"--- [Round {round_idx}] Epoch {epoch} Complete | Avg CTC Loss: {avg_loss:.4f} ---")
+            logging.info(f" [Round {round_idx}] Epoch {epoch} Complete | Avg CTC Loss: {avg_loss:.4f} ")
             
             checkpoint_state = {
                 'round_idx': round_idx,
